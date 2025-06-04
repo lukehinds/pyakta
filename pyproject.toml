@@ -1,7 +1,7 @@
 [project]
 name = "pyakta"
 version = "0.1.0"
-description = "A pure Python implementation of ZCAP-LD (Authorization Capabilities for Linked Data)"
+description = "A Python library for Akta"
 authors = [
     {name = "Luke Hinds", email = "lukehinds@gmail.com"},
 ]
