@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="pyakta",
-    version="0.2.0",
+    version="0.3.0",
     packages=find_packages(include=["pyakta", "pyakta.*"]),
     description="Library for Akta",
     long_description=open("README.md").read(),
