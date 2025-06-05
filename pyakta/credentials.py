@@ -11,6 +11,12 @@ from pyld.documentloader.requests import requests_document_loader
 import base58
 
 from .models import ProofModel, VerifiableCredentialModel
+from .exceptions import (
+    PyaktaError,
+    SignatureError,
+    NormalizationError,
+    VCValidationError,
+)
 
 
 class VerifiableCredential:
@@ -37,7 +43,7 @@ class VerifiableCredential:
             except Exception as e:  # Catch Pydantic validation errors
                 # Potentially re-raise as a custom error or handle
                 print(f"Error initializing VerifiableCredentialModel: {e}")
-                raise
+                raise VCValidationError(f"Error initializing VerifiableCredentialModel: {e}") from e
 
     def build(
         self,
@@ -69,7 +75,7 @@ class VerifiableCredential:
             self.model = VerifiableCredentialModel(**vc_data)
         except Exception as e:
             print(f"Error building VerifiableCredentialModel: {e}")
-            raise
+            raise VCValidationError(f"Error building VerifiableCredentialModel: {e}") from e
         return self
 
     def sign(
@@ -80,7 +86,7 @@ class VerifiableCredential:
     ) -> "VerifiableCredential":
         """Signs the VC and adds the proof block to the Pydantic model."""
         if not self.model:
-            raise ValueError("VC data model must be built or loaded before signing.")
+            raise PyaktaError("VC data model must be built or loaded before signing.")
 
         proof_options = {
             "type": "Ed25519Signature2020",
@@ -123,9 +129,7 @@ class VerifiableCredential:
             )
         except Exception as e:
             print(f"Error during JSON-LD normalization: {e}")
-            raise type(e)(f"JSON-LD Normalization failed: {e}").with_traceback(
-                e.__traceback__
-            )
+            raise NormalizationError(f"JSON-LD Normalization failed: {e}") from e
 
         # Sign the canonicalized N-Quads string (UTF-8 encoded)
         signature_bytes = issuer_signing_key.sign(
@@ -143,7 +147,7 @@ class VerifiableCredential:
             )  # ProofModel type is Ed25519Signature2020 by default
         except Exception as e:
             print(f"Error creating ProofModel for LDP: {e}")
-            raise
+            raise PyaktaError(f"Error creating ProofModel for LDP: {e}") from e
         return self
 
     def verify_signature(
@@ -157,7 +161,7 @@ class VerifiableCredential:
             print(
                 "❌ VC model, proof, or proof.proofValue is missing for LDP verification."
             )
-            return False
+            raise VCValidationError("VC model, proof, or proof.proofValue is missing for LDP verification.")
 
         stored_proof = self.model.proof
         proof_value_b58 = stored_proof.proofValue
@@ -183,7 +187,7 @@ class VerifiableCredential:
             print(
                 "Error: Proof block is missing or not a dictionary in loaded VC for verification."
             )
-            return False
+            raise VCValidationError("Proof block is missing or not a dictionary in loaded VC for verification.")
 
         # Ensure datetime fields are ISO strings as they would have been during signing
         # Pydantic models with json_encoders should manage this upon model_dump.
@@ -200,52 +204,53 @@ class VerifiableCredential:
             )
         except Exception as e:
             print(f"Error during JSON-LD normalization for verification: {e}")
-            return False
+            raise NormalizationError(f"Error during JSON-LD normalization for verification: {e}") from e
 
         # Decode the base58btc proofValue to raw signature bytes
         try:
             signature_bytes = base58.b58decode(proof_value_b58)
         except Exception as e:
             print(f"❌ Error decoding base58 proofValue: {e}")
-            return False
+            raise SignatureError(f"Error decoding base58 proofValue: {e}") from e
 
+        # Cryptographic verification block
         try:
             # Verify the signature against the canonicalized document
             issuer_public_key.verify(
                 normalized_doc_nquads.encode("utf-8"), signature_bytes
             )
-            # Semantic checks (can be kept or enhanced)
-            if expected_issuer_did and self.model.issuer != expected_issuer_did:
-                print(
-                    f"❌ Issuer DID mismatch. Expected {expected_issuer_did}, got {self.model.issuer}"
-                )
-                return False
-            if expected_subject_did:
-                cs_id = (
-                    self.model.credentialSubject.get("id")
-                    if self.model.credentialSubject
-                    else None
-                )
-                if cs_id != expected_subject_did:
-                    print(
-                        f"❌ Subject DID mismatch. Expected {expected_subject_did}, got {cs_id}"
-                    )
-                    return False
-            return True
-        except BadSignatureError:
+        except BadSignatureError as e: # Specific catch for nacl's BadSignatureError
             print(
                 "❌ Signature verification failed: Invalid LDP signature (BadSignatureError)."
             )
-            return False
-        # Should be less common now with direct nacl and base58
-        except ValueError as e:
+            raise SignatureError("Invalid LDP signature (BadSignatureError)") from e
+        except ValueError as e: # Catch other ValueErrors that might occur during verification
             print(f"❌ Signature verification failed: Value error - {e}")
-            return False
-        except Exception as e:
+            raise SignatureError(f"Signature verification failed: Value error - {e}") from e
+        # except Exception as e: # Removing the overly broad Exception here, or making it more specific if necessary
+        #     print(
+        #         f"❌ An unexpected error occurred during LDP signature verification: {e}"
+        #     )
+        #     raise SignatureError(f"An unexpected error occurred during LDP signature verification: {e}") from e
+
+        # Semantic checks (perform only if cryptographic verification passed)
+        if expected_issuer_did and self.model.issuer != expected_issuer_did:
             print(
-                f"❌ An unexpected error occurred during LDP signature verification: {e}"
+                f"❌ Issuer DID mismatch. Expected {expected_issuer_did}, got {self.model.issuer}"
             )
-            return False
+            raise VCValidationError(f"Issuer DID mismatch. Expected {expected_issuer_did}, got {self.model.issuer}")
+        if expected_subject_did:
+            cs_id = (
+                self.model.credentialSubject.get("id")
+                if self.model.credentialSubject
+                else None
+            )
+            if cs_id != expected_subject_did:
+                print(
+                    f"❌ Subject DID mismatch. Expected {expected_subject_did}, got {cs_id}"
+                )
+                raise VCValidationError(f"Subject DID mismatch. Expected {expected_subject_did}, got {cs_id}")
+        return True
 
     @property
     def id(self) -> Optional[str]:
@@ -287,13 +292,13 @@ class VerifiableCredential:
     def to_dict(self) -> Dict[str, Any]:
         """Returns the VC as a dictionary, using Pydantic model dump."""
         if not self.model:
-            raise ValueError("VC model is not initialized.")
+            raise PyaktaError("VC model is not initialized.")
         return self.model.model_dump(by_alias=True, exclude_none=True)
 
     def to_json(self, indent: Optional[int] = 2) -> str:
         """Returns the VC as a JSON string, using Pydantic model dump."""
         if not self.model:
-            raise ValueError("VC model is not initialized.")
+            raise PyaktaError("VC model is not initialized.")
         return self.model.model_dump_json(
             by_alias=True, exclude_none=True, indent=indent
         )
@@ -314,7 +319,7 @@ class VerifiableCredential:
         except Exception as e:
             # Catch Pydantic validation errors
             print(f"Error creating VerifiableCredential from_dict: {e}")
-            raise
+            raise VCValidationError(f"Error creating VerifiableCredential from_dict: {e}") from e
 
     @classmethod
     def from_json(cls, json_str: str) -> "VerifiableCredential":
@@ -324,8 +329,8 @@ class VerifiableCredential:
             return cls.from_dict(data)
         except json.JSONDecodeError as e:
             print(f"Error decoding JSON for VerifiableCredential: {e}")
-            raise
+            raise PyaktaError(f"Error decoding JSON for VerifiableCredential: {e}") from e
         except Exception as e:
             # Catch other errors like Pydantic validation from from_dict
             print(f"Error creating VerifiableCredential from_json: {e}")
-            raise
+            raise VCValidationError(f"Error creating VerifiableCredential from_json: {e}") from e

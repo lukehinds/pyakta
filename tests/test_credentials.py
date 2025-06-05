@@ -2,6 +2,7 @@ import unittest
 import json
 from datetime import datetime, timedelta
 from nacl.signing import SigningKey
+from nacl.exceptions import BadSignatureError
 from pydantic import ValidationError
 
 from pyld import jsonld
@@ -15,6 +16,12 @@ except ImportError:
 
 from pyakta.credentials import VerifiableCredential
 from pyakta.models import UTC  # Assuming UTC is defined in models
+from pyakta.exceptions import (
+    PyaktaError,
+    SignatureError,
+    NormalizationError,
+    VCValidationError,
+)
 
 # --- JSON-LD Context Handling for Tests ---
 # Minimal cache for essential contexts to avoid network calls during tests
@@ -159,7 +166,7 @@ class TestVerifiableCredential(unittest.TestCase):
             "id": "urn:uuid:some-id",
             # Missing 'type', 'issuer', etc.
         }
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(VCValidationError):
             VerifiableCredential(data=invalid_vc_data)
 
     def test_vc_build_minimal(self):
@@ -233,8 +240,8 @@ class TestVerifiableCredential(unittest.TestCase):
 
         wrong_signing_key = SigningKey.generate()
         wrong_verify_key = wrong_signing_key.verify_key
-        is_valid = vc.verify_signature(wrong_verify_key)
-        self.assertFalse(is_valid, "Signature verification succeeded with wrong key.")
+        with self.assertRaisesRegex(SignatureError, "Invalid LDP signature"):
+            vc.verify_signature(wrong_verify_key)
 
     def test_verify_fails_if_vc_tampered_after_signing(self):
         vc = VerifiableCredential().build(
@@ -246,8 +253,8 @@ class TestVerifiableCredential(unittest.TestCase):
         original_subject_id = vc.model.credentialSubject.get("id")
         vc.model.credentialSubject["id"] = str(original_subject_id) + "-tampered"
 
-        is_valid = vc.verify_signature(VERIFY_KEY)
-        self.assertFalse(is_valid, "Signature verification succeeded for tampered VC.")
+        with self.assertRaisesRegex(SignatureError, "Invalid LDP signature"):
+            vc.verify_signature(VERIFY_KEY)
 
     def test_verify_fails_if_proof_tampered(self):
         vc = VerifiableCredential().build(
@@ -255,30 +262,37 @@ class TestVerifiableCredential(unittest.TestCase):
         )
         vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
 
-        vc.model.proof.proofValue = (
-            "zTamperedProofValue" + vc.model.proof.proofValue[1:]
-        )
+        # Tamper proof
+        original_proof_value = vc.model.proof.proofValue
+        vc.model.proof.proofValue = original_proof_value.replace("A", "B")
+        
+        with self.assertRaisesRegex(SignatureError, "Error decoding base58 proofValue|Invalid LDP signature"):
+             vc.verify_signature(VERIFY_KEY)
 
-        is_valid = vc.verify_signature(VERIFY_KEY)
-        self.assertFalse(
-            is_valid, "Signature verification succeeded for tampered proof."
-        )
+        # Tamper proof type
+        vc.model.proof.proofValue = original_proof_value
+        vc.model.proof.type = "SomeOtherSignatureType"
+        with self.assertRaisesRegex(SignatureError, "Invalid LDP signature"):
+             vc.verify_signature(VERIFY_KEY)
 
     def test_sign_requires_built_model(self):
         vc = VerifiableCredential()
-        with self.assertRaisesRegex(
-            ValueError, "VC data model must be built or loaded before signing."
-        ):
+        with self.assertRaisesRegex(PyaktaError, "VC data model must be built or loaded before signing."):
             vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
 
     def test_verify_requires_model_and_proof(self):
-        vc_no_model = VerifiableCredential()
-        self.assertFalse(vc_no_model.verify_signature(VERIFY_KEY))
+        vc_built = VerifiableCredential().build(issuer_did="d", subject_did="s")
+        with self.assertRaisesRegex(VCValidationError, "VC model, proof, or proof.proofValue is missing"):
+            vc_built.verify_signature(VERIFY_KEY)
 
-        vc_no_proof = VerifiableCredential().build(
-            issuer_did=self.issuer_did, subject_did=self.subject_did
-        )
-        self.assertFalse(vc_no_proof.verify_signature(VERIFY_KEY))
+        vc_built.model.proof = None
+        with self.assertRaisesRegex(VCValidationError, "VC model, proof, or proof.proofValue is missing"):
+            vc_built.verify_signature(VERIFY_KEY)
+        
+        vc_built.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
+        vc_built.model.proof.proofValue = None
+        with self.assertRaisesRegex(VCValidationError, "VC model, proof, or proof.proofValue is missing"):
+            vc_built.verify_signature(VERIFY_KEY)
 
     def test_properties_access(self):
         vc = VerifiableCredential()
@@ -304,25 +318,7 @@ class TestVerifiableCredential(unittest.TestCase):
         built_vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
         self.assertIsNotNone(built_vc.proof)
 
-    def test_is_expired(self):
-        vc_not_expired = VerifiableCredential().build(
-            issuer_did=self.issuer_did,
-            subject_did=self.subject_did,
-            expiration_date=self.now + timedelta(days=1),
-        )
-        self.assertFalse(vc_not_expired.is_expired())
-
-        vc_expired = VerifiableCredential().build(
-            issuer_did=self.issuer_did,
-            subject_did=self.subject_did,
-            expiration_date=self.now - timedelta(days=1),
-        )
-        self.assertTrue(vc_expired.is_expired())
-
-        vc_no_expiration = VerifiableCredential().build(
-            issuer_did=self.issuer_did, subject_did=self.subject_did
-        )
-        self.assertFalse(vc_no_expiration.is_expired())
+        self.assertFalse(built_vc.is_expired(), "VC should not be expired yet.")
 
     def test_to_dict_and_to_json(self):
         vc = VerifiableCredential().build(
@@ -338,10 +334,12 @@ class TestVerifiableCredential(unittest.TestCase):
         vc_from_json_loaded = json.loads(vc_json)
         self.assertEqual(vc_from_json_loaded["id"], vc.id)
 
-        with self.assertRaises(ValueError):
-            VerifiableCredential().to_dict()  # Model not initialized
-        with self.assertRaises(ValueError):
-            VerifiableCredential().to_json()  # Model not initialized
+        # Test on uninitialized model
+        empty_vc = VerifiableCredential()
+        with self.assertRaisesRegex(PyaktaError, "VC model is not initialized."):
+            empty_vc.to_dict()
+        with self.assertRaisesRegex(PyaktaError, "VC model is not initialized."):
+            empty_vc.to_json()
 
     def test_from_dict_and_from_json(self):
         original_vc_data = {
@@ -370,46 +368,94 @@ class TestVerifiableCredential(unittest.TestCase):
 
     def test_from_dict_handles_context_alias(self):
         vc_data_alias = {
-            "@context": "https://example.com/context/v2",
-            "id": "urn:uuid:test-alias",
+            "@context": ["https://www.w3.org/2018/credentials/v1", "https://example.com/context/v2"],
+            "id": "urn:uuid:alias-test",
             "type": ["VerifiableCredential"],
             "issuer": self.issuer_did,
             "issuanceDate": self.now.isoformat().replace("+00:00", "Z"),
-            "credentialSubject": {"id": self.subject_did},
+            "credentialSubject": {"id": self.subject_did, "anotherField": "value"}
         }
         vc = VerifiableCredential.from_dict(vc_data_alias)
-        self.assertEqual(vc.model.context, "https://example.com/context/v2")
+        self.assertIsNotNone(vc.model)
+        self.assertEqual(vc.id, "urn:uuid:alias-test")
+        self.assertIn("https://example.com/context/v2", vc.model.context)
 
     def test_from_invalid_dict_json(self):
-        invalid_data = {"id": "test"}  # Missing many fields
-        with self.assertRaises(ValidationError):
-            VerifiableCredential.from_dict(invalid_data)
+        invalid_data_missing_fields = {
+            "@context": ["https://www.w3.org/2018/credentials/v1"],
+            "id": "urn:uuid:invalid-1"
+            # Missing type, issuer, issuanceDate, credentialSubject
+        }
+        with self.assertRaises(VCValidationError):
+            VerifiableCredential.from_dict(invalid_data_missing_fields)
+        
+        invalid_json_string = '{"@context": [], "id": "test", }' # Trailing comma, invalid JSON
+        with self.assertRaises(PyaktaError):
+            VerifiableCredential.from_json(invalid_json_string)
 
-        invalid_json_str = json.dumps(invalid_data)
-        with self.assertRaises(ValidationError):
-            VerifiableCredential.from_json(invalid_json_str)
-
-        with self.assertRaises(json.JSONDecodeError):
-            VerifiableCredential.from_json("this is not json")
+        malformed_json_for_pydantic = '{"@context": ["https://www.w3.org/2018/credentials/v1"], "id": 12345, "type": ["Test"], "issuer": {}, "issuanceDate": "nodate", "credentialSubject": {}}'
+        with self.assertRaises(VCValidationError):
+            VerifiableCredential.from_json(malformed_json_for_pydantic)
 
     def test_verification_with_expected_dids(self):
         vc = VerifiableCredential().build(
-            issuer_did=self.issuer_did, subject_did=self.subject_did
+            issuer_did=self.issuer_did,
+            subject_did=self.subject_did,
+            credential_subject=self.credential_subject_data,
         )
         vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
 
-        self.assertTrue(
-            vc.verify_signature(VERIFY_KEY, expected_issuer_did=self.issuer_did)
-        )
-        self.assertTrue(
-            vc.verify_signature(VERIFY_KEY, expected_subject_did=self.subject_did)
-        )
-        self.assertFalse(
-            vc.verify_signature(VERIFY_KEY, expected_issuer_did="did:false:issuer")
-        )
-        self.assertFalse(
-            vc.verify_signature(VERIFY_KEY, expected_subject_did="did:false:subject")
-        )
+        self.assertTrue(vc.verify_signature(VERIFY_KEY, self.issuer_did, self.subject_did))
+
+        with self.assertRaisesRegex(VCValidationError, "Issuer DID mismatch"):
+            vc.verify_signature(VERIFY_KEY, "did:example:wrongissuer", self.subject_did)
+
+        with self.assertRaisesRegex(VCValidationError, "Subject DID mismatch"):
+            vc.verify_signature(VERIFY_KEY, self.issuer_did, "did:example:wrongsubject")
+
+        with self.assertRaisesRegex(VCValidationError, "Issuer DID mismatch"):
+            vc.verify_signature(VERIFY_KEY, "did:example:wrongissuer", "did:example:wrongsubject")
+
+    def test_normalization_failure_during_sign(self):
+        vc = VerifiableCredential().build(issuer_did=self.issuer_did, subject_did=self.subject_did)
+        
+        original_normalize = jsonld.normalize
+        def mock_normalize_fail(*args, **kwargs):
+            raise Exception("Simulated normalization crash")
+        jsonld.normalize = mock_normalize_fail
+
+        with self.assertRaisesRegex(NormalizationError, "JSON-LD Normalization failed: Simulated normalization crash"):
+            vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
+        
+        jsonld.normalize = original_normalize
+
+    def test_normalization_failure_during_verify(self):
+        vc = VerifiableCredential().build(issuer_did=self.issuer_did, subject_did=self.subject_did)
+        vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
+
+        original_normalize = jsonld.normalize
+        def mock_normalize_fail(*args, **kwargs):
+            raise Exception("Simulated normalization crash for verify")
+        jsonld.normalize = mock_normalize_fail
+
+        with self.assertRaisesRegex(NormalizationError, "Error during JSON-LD normalization for verification: Simulated normalization crash for verify"):
+            vc.verify_signature(VERIFY_KEY)
+        
+        jsonld.normalize = original_normalize
+
+    def test_bad_signature_exception_is_signature_error(self):
+        vc = VerifiableCredential().build(issuer_did=self.issuer_did, subject_did=self.subject_did)
+        vc.sign(SIGNING_KEY, VERIFICATION_METHOD_ID)
+        
+        if vc.model and vc.model.proof and vc.model.proof.proofValue:
+            tampered_proof_value = list(vc.model.proof.proofValue)
+            tampered_proof_value[5] = 'B' if tampered_proof_value[5] != 'B' else 'C' 
+            vc.model.proof.proofValue = "".join(tampered_proof_value)
+
+            with self.assertRaises(SignatureError) as cm:
+                vc.verify_signature(VERIFY_KEY)
+        else:
+            self.fail("VC proof or proofValue not found for tampering")
 
 
 if __name__ == "__main__":

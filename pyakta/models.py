@@ -12,17 +12,13 @@ def _serialize_datetime(dt: datetime, _info: Any) -> str:
     return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-class BaseKeyModel(BaseModel):
-    pass
-
-
-class IssuerKeyFileModel(BaseKeyModel):
+class IssuerKeyFileModel(BaseModel):
     privateKeyMultibase: str
     did: Optional[str] = None
     publicKeyMultibase: Optional[str] = None
 
 
-class WebKeyFileModel(BaseKeyModel):
+class WebKeyFileModel(BaseModel):
     publicKeyMultibase: str
 
 

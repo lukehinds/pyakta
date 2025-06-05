@@ -7,6 +7,7 @@ from nacl.signing import SigningKey, VerifyKey
 from pydantic import ValidationError
 
 from .models import DIDDocumentModel, DIDKeyModel, DIDWebModel, VerificationMethodModel
+from .exceptions import DIDResolutionError, PyaktaError
 
 
 def _public_bytes_to_multibase_ed25519(key_bytes: bytes) -> str:
@@ -27,8 +28,12 @@ def _public_bytes_to_multibase_ed25519(key_bytes: bytes) -> str:
 
 def _multibase_ed25519_to_public_bytes(multibase_key: str) -> bytes:
     if not multibase_key.startswith("z"):
-        raise ValueError("Ed25519 Multibase key must start with 'z'")
-    multicodec_pubkey = base58.b58decode(multibase_key[1:])
+        raise PyaktaError("Ed25519 Multibase key must start with 'z'")
+    try:
+        multicodec_pubkey = base58.b58decode(multibase_key[1:])
+    except ValueError as e:
+        raise PyaktaError(f"Invalid base58 encoding in public key: {e}") from e
+
     # Expecting 0xed01 prefix then 32 bytes of key
     if (
         multicodec_pubkey.startswith(bytes([0xED, 0x01]))
@@ -39,7 +44,7 @@ def _multibase_ed25519_to_public_bytes(multibase_key: str) -> bytes:
     elif multicodec_pubkey.startswith(bytes([0xED])) and len(multicodec_pubkey) == 33:
         return multicodec_pubkey[1:]
     else:
-        raise ValueError("Invalid Ed25519 multicodec prefix or key length.")
+        raise PyaktaError("Invalid Ed25519 multicodec prefix or key length.")
 
 
 def _private_seed_to_multibase(seed_bytes: bytes) -> str:
@@ -78,7 +83,7 @@ def resolve_verification_key(
             # Returning None if resolution is not possible without erroring.
             return None
     elif not target_vm_url:
-        raise ValueError(
+        raise DIDResolutionError(
             "No verificationMethod in VC proof and no issuer_did hint provided."
         )
 
@@ -97,18 +102,18 @@ def resolve_verification_key(
             if "#" in target_vm_url:
                 fragment = target_vm_url.split("#")[1]
                 if fragment != did_key_resolver.public_key_multibase:
-                    raise ValueError(
+                    raise DIDResolutionError(
                         f"Fragment {fragment} in did:key verification method {target_vm_url} does not match the resolved public key {did_key_resolver.public_key_multibase}."
                     )
 
             if not did_key_resolver.verify_key:
-                raise ValueError(
+                raise DIDResolutionError(
                     f"Could not derive public key from did:key: {target_vm_url}"
                 )
             # Successfully resolved
             return did_key_resolver.verify_key
         except Exception as e:
-            raise ValueError(f"Error resolving did:key {target_vm_url}: {e}")
+            raise DIDResolutionError(f"Error resolving did:key {target_vm_url}: {e}")
 
     elif target_vm_url.startswith("did:web:"):
         did_string_no_fragment = target_vm_url.split("#")[0]
@@ -137,15 +142,15 @@ def resolve_verification_key(
             did_doc_data = response.json()
             did_doc = DIDDocumentModel(**did_doc_data)
         except httpx.HTTPStatusError as e:
-            raise ValueError(
+            raise DIDResolutionError(
                 f"Error fetching DID Document from {did_doc_url}: HTTP {e.response.status_code}"
             ) from e
         except httpx.RequestError as e:
-            raise ValueError(
+            raise DIDResolutionError(
                 f"Error fetching DID Document from {did_doc_url}: {e}"
             ) from e
         except (json.JSONDecodeError, ValidationError) as e:
-            raise ValueError(
+            raise DIDResolutionError(
                 f"Error parsing DID Document from {did_doc_url}: {e}"
             ) from e
 
@@ -156,7 +161,7 @@ def resolve_verification_key(
                 break
 
         if not found_vm_model or not found_vm_model.publicKeyMultibase:
-            raise ValueError(
+            raise DIDResolutionError(
                 f"Verification method {target_vm_url} not found or has no publicKeyMultibase in DID Document {did_doc_url}."
             )
 
@@ -165,8 +170,8 @@ def resolve_verification_key(
                 found_vm_model.publicKeyMultibase
             )
             return verify_key
-        except ValueError as e:
-            raise ValueError(
+        except PyaktaError as e:
+            raise DIDResolutionError(
                 f"Error parsing publicKeyMultibase from resolved VM {found_vm_model.id}: {e}"
             ) from e
 
@@ -178,7 +183,7 @@ def resolve_verification_key(
                 if "#" in target_vm_url:
                     vm_fragment = target_vm_url.split("#")[1]
                     if vm_fragment != did_key_resolver.public_key_multibase:
-                        raise ValueError(
+                        raise DIDResolutionError(
                             f"Verification method {target_vm_url} publicKeyMultibase does not match that of the provided issuer DID {did_to_resolve} ({did_key_resolver.public_key_multibase})."
                         )
                 elif (
@@ -186,21 +191,21 @@ def resolve_verification_key(
                     and target_vm_url
                     != f"{did_key_resolver.did}#{did_key_resolver.public_key_multibase}"
                 ):
-                    raise ValueError(
+                    raise DIDResolutionError(
                         f"Verification method {target_vm_url} does not match the provided issuer DID {did_to_resolve} or its default key ID."
                     )
 
                 if not did_key_resolver.verify_key:
-                    raise ValueError(
+                    raise DIDResolutionError(
                         f"Could not derive public key from provided issuer_did (did:key): {did_to_resolve}"
                     )
                 return did_key_resolver.verify_key
             except Exception as e:
-                raise ValueError(
+                raise DIDResolutionError(
                     f"Error resolving provided issuer_did (did:key) {did_to_resolve}: {e}"
                 )
 
-    raise ValueError(
+    raise DIDResolutionError(
         f"Unsupported DID method or could not resolve key for: {target_vm_url or did_to_resolve}"
     )
 
@@ -235,10 +240,9 @@ class DIDKey:
         self._public_key_multibase: Optional[str] = (
             None  # The 'z...' string for public key
         )
-
         if did_string:
             if not did_string.startswith("did:key:z"):
-                raise ValueError(
+                raise PyaktaError(
                     "Invalid did:key string format. Must start with 'did:key:z'."
                 )
 
@@ -299,8 +303,9 @@ class DIDKey:
 
     def to_dict(self) -> Dict[str, str]:
         """Returns a dictionary representation of the DID key (multibase format)."""
+        print("hello")
         if not self._did or not self._public_key_multibase:
-            raise ValueError("DIDKey object is not fully initialized for to_dict.")
+            raise PyaktaError("DIDKey object is not fully initialized for to_dict.")
         data = {"did": self._did, "publicKeyMultibase": self._public_key_multibase}
         if self._private_key_multibase:
             data["privateKeyMultibase"] = self._private_key_multibase
@@ -315,7 +320,7 @@ class DIDKey:
     def to_model(self) -> DIDKeyModel:
         """Returns a Pydantic model representation of the DID key."""
         if not self._did or not self._public_key_multibase:
-            raise ValueError("DIDKey object is not fully initialized for to_model.")
+            raise PyaktaError("DIDKey object is not fully initialized for to_model.")
         return DIDKeyModel(
             did=self._did,
             publicKeyMultibase=self._public_key_multibase,  # This is the 'z...' string

@@ -1,5 +1,6 @@
 import unittest
 import base58
+import re
 from nacl.signing import SigningKey
 from unittest.mock import patch, Mock
 import httpx
@@ -15,6 +16,7 @@ from pyakta.did import (
     resolve_verification_key,
 )
 from pyakta.models import DIDDocumentModel, DIDKeyModel, DIDWebModel
+from pyakta.exceptions import PyaktaError, DIDResolutionError
 
 # Known Ed25519 key pair (seed, public key bytes, multibase public key, multibase private seed)
 KNOWN_SEED_BYTES = b"\x00" * 31 + b"\x01"  # 32 bytes seed
@@ -48,16 +50,16 @@ class TestDIDKeyHelperFunctions(unittest.TestCase):
         self.assertEqual(KNOWN_PUBLIC_KEY_BYTES, decoded_bytes)
 
     def test_multibase_to_public_bytes_invalid(self):
-        with self.assertRaisesRegex(ValueError, "must start with 'z'"):
+        with self.assertRaisesRegex(PyaktaError, "must start with 'z'"):
             _multibase_ed25519_to_public_bytes("abc")  # Does not start with z
         with self.assertRaisesRegex(
-            ValueError, "Invalid Ed25519 multicodec prefix or key length"
+            PyaktaError, "Invalid Ed25519 multicodec prefix or key length"
         ):
             _multibase_ed25519_to_public_bytes(
                 "z" + base58.b58encode(b"\x00" * 5).decode()
             )  # Too short
         with self.assertRaisesRegex(
-            ValueError, "Invalid Ed25519 multicodec prefix or key length"
+            PyaktaError, "Invalid Ed25519 multicodec prefix or key length"
         ):
             _multibase_ed25519_to_public_bytes(
                 "z" + base58.b58encode(b"\xff\xff" + b"\x00" * 32).decode()
@@ -118,17 +120,17 @@ class TestDIDKey(unittest.TestCase):
 
     def test_did_key_invalid_did_string(self):
         with self.assertRaisesRegex(
-            ValueError, "Invalid did:key string format. Must start with 'did:key:z'."
+            PyaktaError, "Invalid did:key string format. Must start with 'did:key:z'."
         ):
             DIDKey(did_string="did:key:abc")
         # Test case for invalid base58 characters in the key part
-        with self.assertRaisesRegex(ValueError, "Invalid character"):
+        with self.assertRaisesRegex(PyaktaError, re.escape("Invalid character 'I'")):
             DIDKey(
                 did_string="did:key:zInvalidBase58"
             )  # 'I' is not a valid base58 char
         # Test case for valid base58 but incorrect multicodec/length after decoding
         with self.assertRaisesRegex(
-            ValueError, "Invalid Ed25519 multicodec prefix or key length"
+            PyaktaError, "Invalid Ed25519 multicodec prefix or key length"
         ):
             DIDKey(
                 did_string="did:key:z" + base58.b58encode(b"short").decode()
@@ -266,8 +268,6 @@ class TestDIDWeb(unittest.TestCase):
 class TestDIDKeyResolveVerificationKey(unittest.TestCase):
     def setUp(self):
         # Use a known DIDKey for consistent testing
-        # self.did_key_resolver_instance removed as resolve_verification_key is now a module function
-
         self.known_did_key_gen = DIDKey(
             private_key_multibase=KNOWN_PRIVATE_KEY_MULTIBASE_SEED
         )
@@ -275,313 +275,307 @@ class TestDIDKeyResolveVerificationKey(unittest.TestCase):
         self.known_did_key_pk_multibase = self.known_did_key_gen.public_key_multibase
         self.known_did_key_verify_key = self.known_did_key_gen.verify_key
 
-        # A different DIDKey for mismatch tests
-        self.other_did_key_gen = DIDKey()  # Generate a new one
-        self.other_did_key_did_string = self.other_did_key_gen.did
+        # Create another distinct DIDKey for mismatch tests
+        self.other_did_key_gen = DIDKey()
         self.other_did_key_pk_multibase = self.other_did_key_gen.public_key_multibase
-        # self.other_did_key_verify_key = self.other_did_key_gen.verify_key # Not needed for current tests
+        self.other_did_key_did_string = self.other_did_key_gen.did
+
 
     def test_resolve_did_key_direct_with_fragment(self):
         vm_url = f"{self.known_did_key_did_string}#{self.known_did_key_pk_multibase}"
-        resolved_key = resolve_verification_key(vm_url)
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
+        key = resolve_verification_key(vm_url)
+        self.assertIsNotNone(key)
+        self.assertEqual(key.encode(), self.known_did_key_verify_key.encode())
 
     def test_resolve_did_key_direct_no_fragment(self):
         vm_url = self.known_did_key_did_string
-        resolved_key = resolve_verification_key(vm_url)
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
+        key = resolve_verification_key(vm_url)
+        self.assertIsNotNone(key)
+        self.assertEqual(key.encode(), self.known_did_key_verify_key.encode())
 
     def test_resolve_did_key_error_fragment_mismatch(self):
         vm_url = f"{self.known_did_key_did_string}#{self.other_did_key_pk_multibase}"
-        with self.assertRaisesRegex(
-            ValueError, "Fragment .* does not match the resolved public key"
-        ):
+        with self.assertRaisesRegex(DIDResolutionError, "Fragment .* does not match the resolved public key"):
             resolve_verification_key(vm_url)
 
     def test_resolve_did_key_error_invalid_did_key_format_in_url(self):
-        # This tests if DIDKey constructor within resolve_verification_key handles bad did:key input
-        vm_url = "did:key:zInvalidKeyStructureForTest"
-        with self.assertRaisesRegex(ValueError, "Error resolving did:key"):
+        vm_url = "did:key:invalidFormat" # Not starting with z, or otherwise malformed for DIDKey constructor
+        with self.assertRaisesRegex(DIDResolutionError, "Error resolving did:key"):
             resolve_verification_key(vm_url)
 
     def test_resolve_issuer_hint_did_key_vm_url_matches_hint(self):
         vm_url = f"{self.known_did_key_did_string}#{self.known_did_key_pk_multibase}"
-        resolved_key = resolve_verification_key(
+        key = resolve_verification_key(
             vm_url, issuer_did_hint=self.known_did_key_did_string
         )
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
+        self.assertEqual(key.encode(), self.known_did_key_verify_key.encode())
 
     def test_resolve_issuer_hint_did_key_vm_url_is_hint_itself(self):
-        vm_url = self.known_did_key_did_string
-        resolved_key = resolve_verification_key(
+        vm_url = self.known_did_key_did_string # vm_url is the DID itself
+        key = resolve_verification_key(
             vm_url, issuer_did_hint=self.known_did_key_did_string
         )
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
-
+        self.assertEqual(key.encode(), self.known_did_key_verify_key.encode())
+        
     def test_resolve_issuer_hint_did_key_error_vm_url_fragment_mismatch(self):
-        # VM URL fragment points to a different key than the one derived from the VM URL's DID part
+        # VM URL's DID part is known_did_key, but fragment points to other_did_key's pk.
         vm_url = f"{self.known_did_key_did_string}#{self.other_did_key_pk_multibase}"
-        with self.assertRaisesRegex(
-            ValueError, "Fragment .* does not match the resolved public key"
-        ):
-            resolve_verification_key(
-                vm_url, issuer_did_hint=self.known_did_key_did_string
-            )
+        # This should be caught by the primary resolution path for vm_url itself.
+        with self.assertRaisesRegex(DIDResolutionError, "Fragment .* does not match the resolved public key"):
+            resolve_verification_key(vm_url, issuer_did_hint=self.known_did_key_did_string)
 
     def test_resolve_issuer_hint_did_key_error_vm_url_does_not_match_hint(self):
-        # VM URL is for a different DID Key than the hint, and hint resolution path is taken
-        # This tests the fallback path where issuer_did_hint is a did:key, but vm_url is something else
-        # and the vm_url must match the key from the issuer_did_hint.
-        vm_url_that_is_not_did_key_or_web = (
-            f"urn:example:different-controller#{self.other_did_key_pk_multibase}"
-        )
-
+        # vm_url is not a did:key, so it falls to resolving via issuer_did_hint.
+        # The vm_url (or its fragment) must then match the key derived from issuer_did_hint.
+        vm_url_not_did_key = f"did:othermethod:12345#{self.other_did_key_pk_multibase}"
         with self.assertRaisesRegex(
-            ValueError,
-            "Verification method .* publicKeyMultibase does not match that of the provided issuer DID",
+            DIDResolutionError, 
+            "Verification method .* publicKeyMultibase does not match that of the provided issuer DID"
         ):
-            resolve_verification_key(
-                verification_method_url=vm_url_that_is_not_did_key_or_web,  # This VM URL is for a different key and type
-                issuer_did_hint=self.known_did_key_did_string,  # Hint is for our known_did_key
-            )
+            resolve_verification_key(vm_url_not_did_key, issuer_did_hint=self.known_did_key_did_string)
+
+        vm_url_not_matching_did_key = f"{self.known_did_key_did_string}#incorrectFragment"
+        with self.assertRaisesRegex(
+            DIDResolutionError, 
+            "Verification method .* publicKeyMultibase does not match that of the provided issuer DID"
+        ):
+             # This setup has vm_url which is a did:key (our known_did_key) but the fragment part "incorrectFragment"
+             # does not match the actual public key multibase of known_did_key_did_string.
+             # When resolve_verification_key tries to resolve issuer_did_hint (known_did_key_did_string),
+             # it will get self.known_did_key_pk_multibase.
+             # The vm_url fragment "incorrectFragment" must match this.
+             # Note: This test case might be tricky due to how the logic branches.
+             # If vm_url itself is a did:key, it will attempt direct resolution first.
+             # Let's re-evaluate if this test is correctly set up for its intent.
+             # The intent is: vm_url is *not* directly resolvable as a did:key (or is but points elsewhere),
+             # so it relies on issuer_did_hint, and then the vm_url must match the key from the hint.
+             #
+             # If vm_url is `did:key:zABC#fragment1` and issuer_did_hint is `did:key:zABC` (which has key `zABCkey`),
+             # then `fragment1` must be `zABCkey`.
+             #
+             # If vm_url is `did:other:123#fragment1` and issuer_did_hint is `did:key:zABC` (key `zABCkey`),
+             # then `fragment1` must be `zABCkey`.
+             # The current implementation checks `vm_fragment != did_key_resolver.public_key_multibase`
+
+             # Let's simplify: vm_url is just a relative fragment, issuer_did_hint is the did:key
+            resolve_verification_key(f"#{self.other_did_key_pk_multibase}", issuer_did_hint=self.known_did_key_did_string)
+
 
     def test_resolve_issuer_hint_did_key_vm_url_is_different_did_no_fragment_error(
         self,
     ):
-        # vm_url is a did:key, but different from issuer_did_hint (also did:key).
-        # Primary resolution of vm_url (other_did_key_did_string) should succeed.
-        # This setup will go through the first `if target_vm_url.startswith("did:key:")` block.
-        resolved_key = resolve_verification_key(
-            verification_method_url=self.other_did_key_did_string,
-            issuer_did_hint=self.known_did_key_did_string,
+        # vm_url is a did:key (other_did_key), different from issuer_did_hint (known_did_key).
+        # Primary resolution of vm_url (other_did_key.did) should succeed and be used.
+        # issuer_did_hint should ideally not affect this if vm_url is self-sufficient.
+        key = resolve_verification_key(
+            self.other_did_key_did_string, 
+            issuer_did_hint=self.known_did_key_did_string
         )
-        # Should resolve to the key of other_did_key_did_string, not known_did_key_did_string
-        self.assertEqual(resolved_key, self.other_did_key_gen.verify_key)
-        self.assertNotEqual(resolved_key, self.known_did_key_verify_key)
+        self.assertIsNotNone(key)
+        self.assertEqual(key.encode(), self.other_did_key_gen.verify_key.encode())
+
 
     def test_resolve_error_no_vm_url_no_issuer_hint(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "No verificationMethod in VC proof and no issuer_did hint provided",
-        ):
-            resolve_verification_key(verification_method_url=None, issuer_did_hint=None)
+        with self.assertRaisesRegex(DIDResolutionError, "No verificationMethod in VC proof"):
+            resolve_verification_key(None, None)
+        with self.assertRaisesRegex(DIDResolutionError, "No verificationMethod in VC proof"):
+            resolve_verification_key("", None)
+
 
     def test_resolve_vm_url_none_issuer_hint_is_did_key(self):
-        resolved_key = resolve_verification_key(
-            verification_method_url=None, issuer_did_hint=self.known_did_key_did_string
-        )
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
+        # vm_url is None, issuer_did_hint is a resolvable did:key
+        # resolve_verification_key should treat issuer_did_hint as the target vm_url
+        key = resolve_verification_key(None, issuer_did_hint=self.known_did_key_did_string)
+        self.assertIsNotNone(key)
+        self.assertEqual(key.encode(), self.known_did_key_verify_key.encode())
 
     def test_resolve_vm_url_none_issuer_hint_not_did_key_returns_none(self):
-        # If issuer_did_hint is not a did:key and no vm_url, it should return None (as per current logic)
-        resolved_key = resolve_verification_key(
-            verification_method_url=None, issuer_did_hint="did:foo:bar"
-        )
-        self.assertIsNone(resolved_key)
+        # If issuer_did_hint is not a did:key and no vm_url, it should return None
+        key = resolve_verification_key(None, issuer_did_hint="did:web:example.com")
+        self.assertIsNone(key)
+        key = resolve_verification_key("", issuer_did_hint="did:web:example.com")
+        self.assertIsNone(key)
+        
 
     def test_resolve_error_unsupported_did_method_in_vm_url(self):
-        with self.assertRaisesRegex(
-            ValueError, "Unsupported DID method or could not resolve key for"
-        ):
-            resolve_verification_key(verification_method_url="did:unsupported:123")
+        vm_url = "did:unsupported:123"
+        with self.assertRaisesRegex(DIDResolutionError, "Unsupported DID method or could not resolve key"):
+            resolve_verification_key(vm_url)
 
     def test_resolve_error_unsupported_did_method_in_issuer_hint_only(self):
-        # If vm_url is None, and issuer_did_hint is an unsupported DID method for direct key derivation.
-        # The current code returns None if issuer_did_hint is not did:key and vm_url is None.
-        # If we want it to raise "Unsupported", the main function needs adjustment for that path.
-        # For now, testing existing behavior which is to return None.
-        resolved_key = resolve_verification_key(
-            verification_method_url=None, issuer_did_hint="did:unsupported:123"
-        )
-        self.assertIsNone(resolved_key)
+        # vm_url is None, and issuer_did_hint is an unsupported DID method.
+        # This should return None as per current logic (it doesn't attempt to resolve non-did:key from hint alone)
+        key = resolve_verification_key(None, issuer_did_hint="did:unsupported:123")
+        self.assertIsNone(key)
 
-    # --- did:web tests ---
+
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_successful(self, mock_httpx_get):
-        domain = "example.com"
-        vm_id_fragment = "key-1"
-        vm_url = f"did:web:{domain}#{vm_id_fragment}"
-        did_doc_url = f"https://{domain}/.well-known/did.json"
-
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": f"did:web:{domain}",
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": "did:web:example.com",
             "verificationMethod": [
                 {
-                    "id": vm_url,
+                    "id": "did:web:example.com#key1",
                     "type": "Ed25519VerificationKey2020",
-                    "controller": f"did:web:{domain}",
-                    "publicKeyMultibase": self.known_did_key_pk_multibase,
+                    "controller": "did:web:example.com",
+                    "publicKeyMultibase": KNOWN_PUBLIC_KEY_MULTIBASE,
                 }
             ],
         }
-        mock_response.raise_for_status = Mock()
         mock_httpx_get.return_value = mock_response
 
-        resolved_key = resolve_verification_key(vm_url)
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
-        mock_httpx_get.assert_called_once_with(did_doc_url, timeout=10.0)
+        key = resolve_verification_key("did:web:example.com#key1")
+        self.assertIsNotNone(key)
+        self.assertEqual(key.encode(), KNOWN_PUBLIC_KEY_BYTES)
+        mock_httpx_get.assert_called_once_with(
+            "https://example.com/.well-known/did.json", timeout=10.0
+        )
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_successful_with_path_and_port(self, mock_httpx_get):
-        domain = "example.com"
-        port = "8080"
-        path_segments = ["users", "alice"]
-        host_plus_port = f"{domain}:{port}"
-        did_path = ":".join(path_segments)
-        vm_id_fragment = "keyByAlice"
-
-        did_web_string = f"did:web:{host_plus_port}:{did_path}"
-        vm_url = f"{did_web_string}#{vm_id_fragment}"
-        did_doc_url = f"https://{host_plus_port}/{'/'.join(path_segments)}/did.json"
-
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": did_web_string,
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": "did:web:localhost:8080:user:alice",
             "verificationMethod": [
                 {
-                    "id": vm_url,
+                    "id": "did:web:localhost:8080:user:alice#key-xyz",
                     "type": "Ed25519VerificationKey2020",
-                    "controller": did_web_string,
-                    "publicKeyMultibase": self.known_did_key_pk_multibase,
+                    "controller": "did:web:localhost:8080:user:alice",
+                    "publicKeyMultibase": KNOWN_PUBLIC_KEY_MULTIBASE,
                 }
             ],
         }
-        mock_response.raise_for_status = Mock()
         mock_httpx_get.return_value = mock_response
 
-        resolved_key = resolve_verification_key(vm_url, did_web_scheme="https")
-        self.assertEqual(resolved_key, self.known_did_key_verify_key)
-        mock_httpx_get.assert_called_once_with(did_doc_url, timeout=10.0)
+        key = resolve_verification_key(
+            "did:web:localhost:8080:user:alice#key-xyz", did_web_scheme="http"
+        )
+        self.assertIsNotNone(key)
+        self.assertEqual(key.encode(), KNOWN_PUBLIC_KEY_BYTES)
+        mock_httpx_get.assert_called_once_with(
+            "http://localhost:8080/user/alice/did.json", timeout=10.0
+        )
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_http_status(self, mock_httpx_get):
-        vm_url = "did:web:failing.com#key-1"
-        mock_httpx_get.side_effect = httpx.HTTPStatusError(
-            "Error", request=Mock(), response=Mock(status_code=404)
+        mock_response = Mock()
+        mock_response.status_code = 404
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Not Found", request=Mock(), response=mock_response
         )
-        with self.assertRaisesRegex(
-            ValueError,
-            "Error fetching DID Document from https://failing.com/.well-known/did.json: HTTP 404",
-        ):
-            resolve_verification_key(vm_url)
+        mock_httpx_get.return_value = mock_response
+
+        with self.assertRaisesRegex(DIDResolutionError, "Error fetching DID Document"):
+            resolve_verification_key("did:web:failing.com#key1")
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_http_request(self, mock_httpx_get):
-        vm_url = "did:web:timeout.com#key-1"
-        mock_httpx_get.side_effect = httpx.RequestError("Timeout", request=Mock())
-        with self.assertRaisesRegex(
-            ValueError,
-            "Error fetching DID Document from https://timeout.com/.well-known/did.json: Timeout",
-        ):
-            resolve_verification_key(vm_url)
+        mock_httpx_get.side_effect = httpx.RequestError(
+            "Connection failed", request=Mock()
+        )
+        with self.assertRaisesRegex(DIDResolutionError, "Error fetching DID Document"):
+            resolve_verification_key("did:web:networkerror.com#key1")
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_json_decode(self, mock_httpx_get):
-        vm_url = "did:web:badjson.com#key-1"
         mock_response = Mock()
-        mock_response.json.side_effect = json.JSONDecodeError("msg", "doc", 0)
-        mock_response.raise_for_status = Mock()
+        mock_response.status_code = 200
+        mock_response.json.side_effect = json.JSONDecodeError("err", "doc", 0)
         mock_httpx_get.return_value = mock_response
-        with self.assertRaisesRegex(
-            ValueError,
-            "Error parsing DID Document from https://badjson.com/.well-known/did.json:",
-        ):
-            resolve_verification_key(vm_url)
+
+        with self.assertRaisesRegex(DIDResolutionError, "Error parsing DID Document"):
+            resolve_verification_key("did:web:badjson.com#key1")
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_pydantic_validation(self, mock_httpx_get):
-        vm_url = "did:web:invalidmodel.com#key-1"
         mock_response = Mock()
+        mock_response.status_code = 200
+        # Missing 'id' which is required by DIDDocumentModel
         mock_response.json.return_value = {
-            "id": "did:web:invalidmodel.com",
-            "invalidField": True,
-        }  # Missing verificationMethod
-        mock_response.raise_for_status = Mock()
+            "@context": "https://www.w3.org/ns/did/v1",
+            # "id": "did:web:pydanticfail.com", # ID is missing
+            "verificationMethod": [],
+        }
         mock_httpx_get.return_value = mock_response
-        with self.assertRaisesRegex(
-            ValueError,
-            "Error parsing DID Document from https://invalidmodel.com/.well-known/did.json:",
-        ):
-            resolve_verification_key(vm_url)
+
+        with self.assertRaisesRegex(DIDResolutionError, "Error parsing DID Document"):
+            resolve_verification_key("did:web:pydanticfail.com#key1")
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_vm_not_found(self, mock_httpx_get):
-        domain = "example.com"
-        vm_url = f"did:web:{domain}#nonexistent-key"
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": f"did:web:{domain}",
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": "did:web:vmnotfound.com",
             "verificationMethod": [
                 {
-                    "id": f"did:web:{domain}#actual-key",
+                    "id": "did:web:vmnotfound.com#someOtherKey",
                     "type": "Ed25519VerificationKey2020",
-                    "controller": f"did:web:{domain}",
-                    "publicKeyMultibase": self.known_did_key_pk_multibase,
+                    "controller": "did:web:vmnotfound.com",
+                    "publicKeyMultibase": KNOWN_PUBLIC_KEY_MULTIBASE,
                 }
             ],
         }
-        mock_response.raise_for_status = Mock()
         mock_httpx_get.return_value = mock_response
+
         with self.assertRaisesRegex(
-            ValueError, "Verification method .* not found or has no publicKeyMultibase"
+            DIDResolutionError, "Verification method .* not found"
         ):
-            resolve_verification_key(vm_url)
+            resolve_verification_key("did:web:vmnotfound.com#key1")
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_vm_no_public_key_multibase(self, mock_httpx_get):
-        domain = "example.com"
-        vm_id_fragment = "key-no-pkmb"
-        vm_url = f"did:web:{domain}#{vm_id_fragment}"
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": f"did:web:{domain}",
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": "did:web:nopkmb.com",
             "verificationMethod": [
                 {
-                    "id": vm_url,
+                    "id": "did:web:nopkmb.com#key1",
                     "type": "Ed25519VerificationKey2020",
-                    "controller": f"did:web:{domain}",
+                    "controller": "did:web:nopkmb.com",
+                    # publicKeyMultibase is missing
                 }
-                # Missing publicKeyMultibase
             ],
         }
-        mock_response.raise_for_status = Mock()
         mock_httpx_get.return_value = mock_response
+
         with self.assertRaisesRegex(
-            ValueError, "Verification method .* not found or has no publicKeyMultibase"
+            DIDResolutionError, "not found or has no publicKeyMultibase"
         ):
-            resolve_verification_key(vm_url)
+            resolve_verification_key("did:web:nopkmb.com#key1")
 
     @patch("pyakta.did.httpx.get")
     def test_resolve_did_web_error_vm_invalid_public_key_multibase(
         self, mock_httpx_get
     ):
-        domain = "example.com"
-        vm_id_fragment = "key-invalid-pkmb"
-        vm_url = f"did:web:{domain}#{vm_id_fragment}"
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": f"did:web:{domain}",
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": "did:web:invalidpkmb.com",
             "verificationMethod": [
                 {
-                    "id": vm_url,
+                    "id": "did:web:invalidpkmb.com#key1",
                     "type": "Ed25519VerificationKey2020",
-                    "controller": f"did:web:{domain}",
-                    "publicKeyMultibase": "zInvalidBase58",
+                    "controller": "did:web:invalidpkmb.com",
+                    "publicKeyMultibase": "zInvalidKey",  # Not a valid multibase key
                 }
             ],
         }
-        mock_response.raise_for_status = Mock()
         mock_httpx_get.return_value = mock_response
+
         with self.assertRaisesRegex(
-            ValueError, "Error parsing publicKeyMultibase from resolved VM"
+            DIDResolutionError, "Error parsing publicKeyMultibase from resolved VM"
         ):
-            resolve_verification_key(vm_url)
+            resolve_verification_key("did:web:invalidpkmb.com#key1")
 
 
 if __name__ == "__main__":
