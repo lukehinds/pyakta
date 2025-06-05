@@ -18,6 +18,7 @@ dependencies = [
     "pydantic>=2.11.0",
     "pyld>=2.0.4",
     "requests>=2.32.3",
+    "httpx>=0.28.1",
 ]
 
 requires-python = ">=3.11"

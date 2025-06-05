@@ -1,7 +1,10 @@
 from typing import Any, Dict, List, Optional
 
 import base58
+import httpx
+import json
 from nacl.signing import SigningKey, VerifyKey
+from pydantic import ValidationError
 
 from .models import DIDDocumentModel, DIDKeyModel, DIDWebModel, VerificationMethodModel
 
@@ -116,6 +119,129 @@ class DIDKey:
                 self._public_key_bytes
             )
             self._did = f"did:key:{self._public_key_multibase}"
+
+    def get_verify_key_from_multibase(self, pk_multibase: str) -> VerifyKey:
+        if not pk_multibase.startswith('z'):
+            raise ValueError("Ed25519 publicKeyMultibase must start with 'z'")
+        multicodec_pubkey = base58.b58decode(pk_multibase[1:])
+        if multicodec_pubkey.startswith(bytes([0xed, 0x01])) and len(multicodec_pubkey) == 34:
+            public_key_bytes = multicodec_pubkey[2:]
+        elif multicodec_pubkey.startswith(bytes([0xed])) and len(multicodec_pubkey) == 33:
+            public_key_bytes = multicodec_pubkey[1:]
+        else:
+            raise ValueError("Invalid Ed25519 multicodec prefix or key length in publicKeyMultibase.")
+        return VerifyKey(public_key_bytes)
+
+    def resolve_verification_key(self, verification_method_url: str, issuer_did_hint: Optional[str] = None, did_web_scheme: str = 'https') -> Optional[VerifyKey]:
+        """Resolves the public verification key from a verification method URL or an issuer DID hint."""
+
+        target_vm_url = verification_method_url # Primarily use the VM from the proof
+        did_to_resolve = issuer_did_hint
+
+        if not target_vm_url and issuer_did_hint:
+            # If only issuer_did_hint is provided, we assume it might be a did:key that IS the verification method
+            if issuer_did_hint.startswith("did:key:"):
+                target_vm_url = issuer_did_hint # For did:key, the DID itself can be the VM
+            else:
+                # For other did methods, if no explicit VM in proof, we can't proceed without more info
+                # or a convention (e.g. did_doc.verificationMethod[0]) which is risky.
+                # Returning None if resolution is not possible without erroring.
+                return None
+        elif not target_vm_url:
+            raise ValueError("No verificationMethod in VC proof and no issuer_did hint provided.")
+
+        # Priority 1: Direct resolution if verification_method_url itself is a full did:key URI (with fragment)
+        # e.g. did:key:zABC#zABC
+        if target_vm_url.startswith("did:key:"):
+            try:
+                # The DIDKey constructor can often handle the full VM URL if it's just did#publicKeyMultibase
+                # Or, if it's the DID itself, it will resolve its own key.
+                key_did_string = target_vm_url.split('#')[0]
+                did_key_resolver = DIDKey(did_string=key_did_string)
+
+                # Check if the fragment (publicKeyMultibase) matches the resolved key's multibase
+                # This ensures the specified key in the fragment is indeed THE key of the DID.
+                if "#" in target_vm_url:
+                    fragment = target_vm_url.split('#')[1]
+                    if fragment != did_key_resolver.public_key_multibase:
+                        raise ValueError(f"Fragment {fragment} in did:key verification method {target_vm_url} does not match the resolved public key {did_key_resolver.public_key_multibase}.")
+
+                if not did_key_resolver.verify_key:
+                    raise ValueError(f"Could not derive public key from did:key: {target_vm_url}")
+                # Successfully resolved
+                return did_key_resolver.verify_key
+            except Exception as e:
+                raise ValueError(f"Error resolving did:key {target_vm_url}: {e}")
+
+        # Priority 2: did:web resolution using the verification_method_url
+        elif target_vm_url.startswith("did:web:"):
+            did_string_no_fragment = target_vm_url.split('#')[0]
+            identifier_after_prefix = did_string_no_fragment[len("did:web:"):]
+            parts = identifier_after_prefix.split(':')
+            host_plus_port = parts[0]
+            path_start_index = 1
+
+            if ':' not in parts[0] and len(parts) > 1 and parts[1].isdigit():
+                host_plus_port = f"{parts[0]}:{parts[1]}"
+                path_start_index = 2
+
+            path_segments = parts[path_start_index:]
+            url_path_part = "/".join(segment for segment in path_segments if segment)
+
+            if not url_path_part:
+                did_doc_url = f"{did_web_scheme}://{host_plus_port}/.well-known/did.json"
+            else:
+                did_doc_url = f"{did_web_scheme}://{host_plus_port}/{url_path_part}/did.json"
+
+            try:
+                response = httpx.get(did_doc_url, timeout=10.0)
+                response.raise_for_status()
+                did_doc_data = response.json()
+                did_doc = DIDDocumentModel(**did_doc_data)
+            except httpx.HTTPStatusError as e:
+                raise ValueError(f"Error fetching DID Document from {did_doc_url}: HTTP {e.response.status_code}") from e
+            except httpx.RequestError as e:
+                raise ValueError(f"Error fetching DID Document from {did_doc_url}: {e}") from e
+            except (json.JSONDecodeError, ValidationError) as e:
+                raise ValueError(f"Error parsing DID Document from {did_doc_url}: {e}") from e
+
+            found_vm_model = None
+            for vm_model in did_doc.verificationMethod:
+                if vm_model.id == target_vm_url:
+                    found_vm_model = vm_model
+                    break
+
+            if not found_vm_model or not found_vm_model.publicKeyMultibase:
+                raise ValueError(f"Verification method {target_vm_url} not found or has no publicKeyMultibase in DID Document {did_doc_url}.")
+
+            try:
+                verify_key_bytes = _multibase_ed25519_to_public_bytes(found_vm_model.publicKeyMultibase)
+                verify_key = VerifyKey(verify_key_bytes)
+                return verify_key
+            except ValueError as e:
+                raise ValueError(f"Error parsing publicKeyMultibase from resolved VM {found_vm_model.id}: {e}") from e
+
+        # Fallback or other DID methods if issuer_did_hint was different and not yet resolved
+        elif did_to_resolve:
+            if did_to_resolve.startswith("did:key:"):
+                try:
+                    did_key_resolver = DIDKey(did_string=did_to_resolve.split('#')[0])
+                    if "#" in target_vm_url:
+                        vm_fragment = target_vm_url.split('#')[1]
+                        if vm_fragment != did_key_resolver.public_key_multibase:
+                            raise ValueError(f"Verification method {target_vm_url} publicKeyMultibase does not match that of the provided issuer DID {did_to_resolve} ({did_key_resolver.public_key_multibase}).")
+                    elif target_vm_url != did_key_resolver.did and target_vm_url != f"{did_key_resolver.did}#{did_key_resolver.public_key_multibase}":
+                        raise ValueError(f"Verification method {target_vm_url} does not match the provided issuer DID {did_to_resolve} or its default key ID.")
+
+                    if not did_key_resolver.verify_key:
+                        raise ValueError(f"Could not derive public key from provided issuer_did (did:key): {did_to_resolve}")
+                    return did_key_resolver.verify_key
+                except Exception as e:
+                    raise ValueError(f"Error resolving provided issuer_did (did:key) {did_to_resolve}: {e}")
+            # Add elif for did_to_resolve.startswith("did:web:") if needed
+
+        # If no specific resolution path matched or an unhandled case for did_to_resolve
+        raise ValueError(f"Unsupported DID method or could not resolve key for: {target_vm_url or did_to_resolve}")
 
     @property
     def did(self) -> Optional[str]:
