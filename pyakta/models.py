@@ -54,7 +54,7 @@ class VerifiableCredentialModel(BaseModel):
     issuanceDate: datetime
     expirationDate: Optional[datetime] = None
     credentialSubject: Dict[str, Any]
-    evidence: Optional[List[Dict[str, Any]]] = None 
+    evidence: Optional[List[Dict[str, Any]]] = None
     proof: Optional[ProofModel] = None
 
     model_config = ConfigDict(populate_by_name=True, validate_assignment=True)
