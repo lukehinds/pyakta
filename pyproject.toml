@@ -1,6 +1,6 @@
 [project]
 name = "pyakta"
-version = "0.3.0"
+version = "0.4.0"
 description = "A Python library for Akta Agent to Agent Trust Protocol"
 authors = [
     {name = "Luke Hinds", email = "lukehinds@gmail.com"},
@@ -18,6 +18,7 @@ dependencies = [
     "pydantic>=2.11.0",
     "pyld>=2.0.4",
     "requests>=2.32.3",
+    "httpx>=0.28.1",
 ]
 
 requires-python = ">=3.11"
