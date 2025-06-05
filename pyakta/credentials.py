@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, List, Union
 
 
 from pyld import jsonld
+from pyld.documentloader.requests import requests_document_loader
 import base58
 
 from .models import ProofModel, VerifiableCredentialModel
@@ -111,13 +112,20 @@ class VerifiableCredential:
         # Canonicalize using URDNA2015 algorithm
         # The `jsonld` library expects the document itself, not a JSON string.
         try:
+            doc_loader = requests_document_loader()
             normalized_doc_nquads = jsonld.normalize(
                 doc_to_canonicalize,
-                options={"algorithm": "URDNA2015", "format": "application/n-quads"},
+                options={
+                    "algorithm": "URDNA2015",
+                    "format": "application/n-quads",
+                    "documentLoader": doc_loader,
+                },
             )
         except Exception as e:
             print(f"Error during JSON-LD normalization: {e}")
-            raise
+            raise type(e)(f"JSON-LD Normalization failed: {e}").with_traceback(
+                e.__traceback__
+            )
 
         # Sign the canonicalized N-Quads string (UTF-8 encoded)
         signature_bytes = issuer_signing_key.sign(
@@ -181,9 +189,14 @@ class VerifiableCredential:
         # Pydantic models with json_encoders should manage this upon model_dump.
 
         try:
+            doc_loader = requests_document_loader()
             normalized_doc_nquads = jsonld.normalize(
                 doc_to_verify,
-                options={"algorithm": "URDNA2015", "format": "application/n-quads"},
+                options={
+                    "algorithm": "URDNA2015",
+                    "format": "application/n-quads",
+                    "documentLoader": doc_loader,
+                },
             )
         except Exception as e:
             print(f"Error during JSON-LD normalization for verification: {e}")
